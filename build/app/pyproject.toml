@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "autoheal"
+version = "1.0.0"
+description = "Docker container auto-heal monitor"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+docker = "^7.1.0"
+httpx = "^0.28.1"
+ping3 = "^4.0.8"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
