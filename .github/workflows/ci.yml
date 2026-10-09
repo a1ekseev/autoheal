@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.14.0
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: go mod tidy is clean
+        run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+      - name: Dockerfile lint (hadolint)
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Allow unprivileged ICMP for ping tests
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - name: go test
+        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Same Go as the other jobs; -show verbose lists every finding, including
+      # ones in dependencies the code does not call (those do not fail the job).
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -show verbose ./...
+
+  integration:
+    name: Integration tests (docker compose)
+    runs-on: ubuntu-24.04
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-buildx-action@v4
+        with:
+          # Anonymous Docker Hub pulls are rate-limited (429) on shared runners.
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build test images
+        run: docker compose -f docker-compose.test.yml --profile "*" build
+      - name: go test -tags integration
+        env:
+          AUTOHEAL_IT_BUILD: "0"
+        # Failing tests print the logs of the autoheal instance under test.
+        run: go test -tags integration -count=1 -v -timeout 15m ./integration/...
+
+  image:
+    name: Build & publish image
+    runs-on: ubuntu-24.04
+    needs: [integration, vuln]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      # No QEMU needed: the Go binary is cross-compiled on $BUILDPLATFORM and
+      # the runtime stage has no RUN instructions.
+      - uses: docker/setup-buildx-action@v4
+        with:
+          # Anonymous Docker Hub pulls are rate-limited (429) on shared runners.
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          # On pull requests the image is only built: keep it in the build cache.
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

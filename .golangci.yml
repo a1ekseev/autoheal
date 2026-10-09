@@ -1,0 +1,78 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration]
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - errname
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocritic
+    - gosec
+    - intrange
+    - misspell
+    - modernize
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - revive
+    - sloglint
+    - testifylint
+    - thelper
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wrapcheck
+  settings:
+    govet:
+      enable-all: true
+      disable: [fieldalignment, shadow]
+    sloglint:
+      attr-only: true
+      # Log messages intentionally reproduce the original Python monitor verbatim.
+      static-msg: false
+      key-naming-case: snake
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+    wrapcheck:
+      ignore-sig-regexps:
+        - '\.Errorf\('
+        - 'errors\.(New|Join)\('
+  exclusions:
+    generated: lax
+    presets: [comments, std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [wrapcheck, forcetypeassert, gosec, containedctx]
+      - path: test/target/
+        linters: [gosec]
+
+formatters:
+  enable: [gofumpt, gci]
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+    gci:
+      sections: [standard, default, localmodule]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

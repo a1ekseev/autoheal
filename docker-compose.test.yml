@@ -1,0 +1,192 @@
+# Integration test stand: real autoheal containers watching real containers.
+# Used by `go test -tags integration ./integration/...` (see justfile / CI).
+#
+# Targets start by default. Each autoheal variant lives in its own profile and
+# is started by the test that needs it, one at a time.
+name: autoheal-it
+
+# Each image is built once (by the service carrying `build:`); every other
+# service reuses it.
+x-target: &target
+  image: autoheal-testtarget:it
+
+x-autoheal: &autoheal
+  image: autoheal:it
+
+services:
+  # --- monitors --------------------------------------------------------------
+  autoheal:
+    <<: *autoheal
+    build: { context: ., target: runtime }
+    profiles: [main]
+    environment:
+      CHECK_INTERVAL: "1"
+      FAIL_THRESHOLD: "3"
+      PING_TIMEOUT: "1"
+      CURL_TIMEOUT: "1"
+      LOG_LEVEL: DEBUG
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Cannot open ICMP sockets at all: must not restart anything because of it.
+  autoheal-noicmp:
+    <<: *autoheal
+    profiles: [noicmp]
+    cap_drop: [NET_RAW]
+    sysctls:
+      net.ipv4.ping_group_range: "1 0"
+    environment:
+      CHECK_INTERVAL: "1"
+      FAIL_THRESHOLD: "1"
+      LOG_LEVEL: WARNING
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Talks to Docker over TCP (DOCKER_HOST) through a proxy that allows
+  # listing but forbids POST, so every restart fails.
+  socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    profiles: [proxied]
+    environment:
+      CONTAINERS: "1"
+      POST: "0"
+      DISABLE_IPV6: "1" # some CI/sandbox hosts have no IPv6
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  autoheal-proxied:
+    <<: *autoheal
+    profiles: [proxied]
+    depends_on: [socket-proxy]
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+      CHECK_INTERVAL: "1"
+      FAIL_THRESHOLD: "2"
+      CURL_TIMEOUT: "1"
+      PING_TIMEOUT: "1"
+
+  # --- must stay up ----------------------------------------------------------
+  curl-ok:
+    <<: *target
+    build: { context: ., target: testtarget }
+    environment: { BODY: "status: OK" }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-ok:8080/health
+      autoheal.monitor.curl.response: OK
+
+  # Status code is ignored: 500 with the expected body passes.
+  curl-500-match:
+    <<: *target
+    environment: { BODY: "status: OK", STATUS: "500" }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-500-match:8080/
+      autoheal.monitor.curl.response: OK
+
+  # No curl.response label: any HTTP response passes, even 503 with no body.
+  curl-any:
+    <<: *target
+    environment: { STATUS: "503" }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-any:8080/
+
+  # Fails every second check: the counter is reset by each success.
+  curl-flap:
+    <<: *target
+    environment: { BODY: "status: OK", FLAP: "true" }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-flap:8080/
+      autoheal.monitor.curl.response: OK
+
+  ping-ok:
+    <<: *target
+    labels:
+      autoheal.monitor.enable: "True"
+      autoheal.monitor.ping: ping-ok
+
+  # Ping wins over curl: the failing curl check is never run.
+  ping-wins:
+    <<: *target
+    environment: { BODY: DOWN }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.ping: ping-wins
+      autoheal.monitor.curl: http://ping-wins:8080/
+      autoheal.monitor.curl.response: OK
+
+  no-check:
+    <<: *target
+    labels:
+      autoheal.monitor.enable: "true"
+
+  # Not monitored: enable is "false", has whitespace, or is missing.
+  enable-false:
+    <<: *target
+    environment: { BODY: DOWN }
+    labels:
+      autoheal.monitor.enable: "false"
+      autoheal.monitor.curl: http://enable-false:8080/
+      autoheal.monitor.curl.response: OK
+
+  enable-space:
+    <<: *target
+    environment: { BODY: DOWN }
+    labels:
+      autoheal.monitor.enable: " true"
+      autoheal.monitor.curl: http://enable-space:8080/
+      autoheal.monitor.curl.response: OK
+
+  enable-missing:
+    <<: *target
+    environment: { BODY: DOWN }
+    labels:
+      autoheal.monitor.curl: http://enable-missing:8080/
+      autoheal.monitor.curl.response: OK
+
+  # --- must be restarted -----------------------------------------------------
+  curl-bad:
+    <<: *target
+    environment: { BODY: DOWN }
+    labels:
+      autoheal.monitor.enable: "TRUE"
+      autoheal.monitor.curl: http://curl-bad:8080/health
+      autoheal.monitor.curl.response: OK
+
+  curl-refused:
+    <<: *target
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-refused:9999/
+
+  # Redirects are not followed: the 302 body is checked and lacks "OK".
+  curl-redirect:
+    <<: *target
+    environment: { BODY: moved, STATUS: "302", LOCATION: "http://curl-ok:8080/" }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-redirect:8080/
+      autoheal.monitor.curl.response: OK
+
+  # Answers after CURL_TIMEOUT.
+  curl-slow:
+    <<: *target
+    environment: { BODY: "status: OK", DELAY: 3s }
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.curl: http://curl-slow:8080/
+      autoheal.monitor.curl.response: OK
+
+  ping-unknown:
+    <<: *target
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.ping: host.does-not-exist.invalid
+
+  ping-noreply:
+    <<: *target
+    labels:
+      autoheal.monitor.enable: "true"
+      autoheal.monitor.ping: 203.0.113.7
